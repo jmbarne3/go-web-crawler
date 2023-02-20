@@ -1,7 +1,6 @@
 package crawler
 
 import (
-	"context"
 	"crypto/tls"
 	"encoding/csv"
 	"errors"
@@ -9,11 +8,14 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
-	"github.com/PullRequestInc/go-gpt3"
+	"github.com/solywsh/chatgpt"
 )
 
 func Crawl(config *CrawlerConfig) {
@@ -22,6 +24,8 @@ func Crawl(config *CrawlerConfig) {
 
 	parseDomainFile(&config.DomainFilePath, &domains)
 	crawlDomains(config, &domains, &results)
+	addAnalytics(config, results)
+	writeOutput(config, results)
 }
 
 func parseDomainFile(filepath *string, domains *[]string) {
@@ -82,23 +86,18 @@ func crawlDomains(config *CrawlerConfig, domains *[]string, results *[]CrawlerRe
 	}
 
 	var gptWg sync.WaitGroup
-	ctx := context.Background()
-	gptClient := gpt3.NewClient(config.APIKey)
+	chat := chatgpt.New(config.APIKey, "user_id(not required)", 30*time.Second)
+	defer chat.Close()
 
 	for _, result := range *results {
 		if result.AnswersHttps {
 			gptWg.Add(1)
 			https_url := fmt.Sprintf("https://%s", result.Domain)
-			go parsePage(https_url, &client, &ctx, gptClient, &result, &gptWg)
+			go parsePage(https_url, &client, chat, &result, &gptWg)
 		}
 	}
 
 	gptWg.Wait()
-
-	for _, result := range *results {
-		fmt.Println(result)
-		// fmt.Println(result.Description)
-	}
 }
 
 func checkUrl(url string, client *http.Client, respond *bool, wg *sync.WaitGroup) {
@@ -121,7 +120,13 @@ func checkUrl(url string, client *http.Client, respond *bool, wg *sync.WaitGroup
 }
 
 func checkRedirect(url string, client *http.Client, redirect *bool, wg *sync.WaitGroup) {
-	resp, _ := client.Get(url)
+	resp, err := client.Get(url)
+
+	if strings.HasSuffix(err.Error(), ": no such host") {
+		*redirect = false
+		wg.Done()
+		return
+	}
 
 	if (resp.StatusCode >= 301) && (resp.StatusCode <= 302) || (resp.StatusCode >= 307) && (resp.StatusCode <= 308) {
 		*redirect = true
@@ -147,7 +152,7 @@ func checkCertificate(domain string, validCertificate *bool, wg *sync.WaitGroup)
 	wg.Done()
 }
 
-func parsePage(url string, client *http.Client, ctx *context.Context, gptClient gpt3.Client, result *CrawlerResult, wg *sync.WaitGroup) {
+func parsePage(url string, client *http.Client, chat *chatgpt.ChatGPT, result *CrawlerResult, wg *sync.WaitGroup) {
 	resp, err := client.Get(url)
 	if err != nil {
 		log.Fatal(err)
@@ -172,28 +177,120 @@ func parsePage(url string, client *http.Client, ctx *context.Context, gptClient 
 			result.H2Text = append(result.H2Text, obj.Text())
 		})
 
-		prompt := fmt.Sprintf("Summarize the content on the home page of the website %s.", url)
+		prompt := fmt.Sprintf("Summarize the content on the following page: %s", url)
 
-		fmt.Println(prompt)
-
-		resp, err := gptClient.Completion(*ctx, gpt3.CompletionRequest{
-			Prompt:           []string{prompt},
-			Temperature:      gpt3.Float32Ptr(0.7),
-			MaxTokens:        gpt3.IntPtr(100),
-			TopP:             gpt3.Float32Ptr(1.0),
-			N:                gpt3.IntPtr(1),
-			FrequencyPenalty: 0.0,
-			PresencePenalty:  0.0,
-			Echo:             false,
-		})
+		ans, err := chat.Chat(prompt)
 
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		result.Description = resp.Choices[0].Text
-		fmt.Println(result.Description)
+		result.Description = ans
 	}
 
 	wg.Done()
+}
+
+func addAnalytics(config *CrawlerConfig, results []CrawlerResult) {
+	records := make(map[string]AnalyticRecord)
+
+	f, err := os.Open(config.AnalyticsFilePath)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	defer f.Close()
+
+	reader := csv.NewReader(f)
+	data, err := reader.ReadAll()
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	durationRegex := regexp.MustCompile(`(\d{2}):(\d{2}):(\d{2})`)
+
+	for i, line := range data {
+		if i > 0 { // Skip the header line
+			domain := strings.TrimRight(line[0], "/")
+			pageViews, _ := strconv.Atoi(strings.Replace(line[1], ",", "", -1))
+			uniqueViews, _ := strconv.Atoi(strings.Replace(line[2], ",", "", -1))
+			avgTimePage, _ := time.ParseDuration(durationRegex.ReplaceAllString(line[3], "${1}h${2}m${3}s"))
+			bounceRate, _ := strconv.ParseFloat(strings.Replace(line[4], "%", "", 1), 32)
+			exitPercentage, _ := strconv.ParseFloat(strings.Replace(line[5], "%", "", 1), 32)
+
+			records[domain] = AnalyticRecord{
+				Domain:         domain,
+				PageViews:      pageViews,
+				UniqueViews:    uniqueViews,
+				AvgTimePage:    avgTimePage,
+				BounceRate:     float32(bounceRate),
+				ExitPercentage: float32(exitPercentage),
+			}
+		}
+	}
+
+	for _, result := range results {
+		if val, ok := records[result.Domain]; ok {
+			result.PageViews = val.PageViews
+			result.UniqueViews = val.UniqueViews
+			result.AvgTimePage = val.AvgTimePage
+			result.BounceRate = val.BounceRate
+			result.ExitPercentage = val.ExitPercentage
+		}
+	}
+}
+
+func writeOutput(config *CrawlerConfig, results []CrawlerResult) {
+	f, err := os.Create(config.OutputFilePath)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	defer f.Close()
+
+	writer := csv.NewWriter(f)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	defer writer.Flush()
+
+	// Write the header line
+	writer.Write([]string{
+		"domain",
+		"answer_http",
+		"redirects_to_https",
+		"answers_https",
+		"valid_certificate",
+		"title",
+		"h1_text",
+		"h2_text",
+		"description",
+		"page_views",
+		"unique_page_views",
+		"avg_time_page",
+		"bounce_rate",
+		"exit_percentage",
+	})
+
+	for _, result := range results {
+		writer.Write([]string{
+			result.Domain,
+			fmt.Sprintf("%t", result.AnswersHttp),
+			fmt.Sprintf("%t", result.RedirectHttps),
+			fmt.Sprintf("%t", result.AnswersHttps),
+			fmt.Sprintf("%t", result.ValidCertificate),
+			result.Title,
+			result.H1Text,
+			strings.Join(result.H2Text, ", "),
+			result.Description,
+			fmt.Sprintf("%d", result.PageViews),
+			fmt.Sprintf("%d", result.UniqueViews),
+			fmt.Sprintf("%s", result.AvgTimePage),
+			fmt.Sprintf("%f", result.BounceRate),
+			fmt.Sprintf("%f", result.ExitPercentage),
+		})
+	}
 }
