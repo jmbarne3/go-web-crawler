@@ -46,6 +46,7 @@ func main() {
 		DomainFilePath:    domain_path,
 		AnalyticsFilePath: analytics_path,
 		OutputFilePath:    output_path,
+		APIKey:            *api_key,
 	}
 
 	crawler.Crawl(&config)

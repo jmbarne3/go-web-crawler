@@ -11,6 +11,7 @@ type CrawlerResult struct {
 	Title            string
 	H1Text           string
 	H2Text           []string
+	Description      string
 	PageViews        int
 	UniqueViews      int
 	AvgTimePage      time.Duration

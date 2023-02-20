@@ -1,6 +1,7 @@
 package crawler
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/csv"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
+	"github.com/PullRequestInc/go-gpt3"
 )
 
 func Crawl(config *CrawlerConfig) {
@@ -19,7 +21,7 @@ func Crawl(config *CrawlerConfig) {
 	var results []CrawlerResult
 
 	parseDomainFile(&config.DomainFilePath, &domains)
-	crawlDomains(&domains, &results)
+	crawlDomains(config, &domains, &results)
 }
 
 func parseDomainFile(filepath *string, domains *[]string) {
@@ -48,7 +50,7 @@ func noRedirect(req *http.Request, via []*http.Request) error {
 	return errors.New("don't redirect")
 }
 
-func crawlDomains(domains *[]string, results *[]CrawlerResult) {
+func crawlDomains(config *CrawlerConfig, domains *[]string, results *[]CrawlerResult) {
 	var wg sync.WaitGroup
 
 	client := http.Client{
@@ -76,12 +78,26 @@ func crawlDomains(domains *[]string, results *[]CrawlerResult) {
 		go checkCertificate(domain, &result.ValidCertificate, &wg)
 
 		wg.Wait()
-
-		if result.AnswersHttps {
-			go parsePage(https_url, &client, &result)
-		}
-
 		*results = append(*results, result)
+	}
+
+	var gptWg sync.WaitGroup
+	ctx := context.Background()
+	gptClient := gpt3.NewClient(config.APIKey)
+
+	for _, result := range *results {
+		if result.AnswersHttps {
+			gptWg.Add(1)
+			https_url := fmt.Sprintf("https://%s", result.Domain)
+			go parsePage(https_url, &client, &ctx, gptClient, &result, &gptWg)
+		}
+	}
+
+	gptWg.Wait()
+
+	for _, result := range *results {
+		fmt.Println(result)
+		// fmt.Println(result.Description)
 	}
 }
 
@@ -131,7 +147,7 @@ func checkCertificate(domain string, validCertificate *bool, wg *sync.WaitGroup)
 	wg.Done()
 }
 
-func parsePage(url string, client *http.Client, result *CrawlerResult) {
+func parsePage(url string, client *http.Client, ctx *context.Context, gptClient gpt3.Client, result *CrawlerResult, wg *sync.WaitGroup) {
 	resp, err := client.Get(url)
 	if err != nil {
 		log.Fatal(err)
@@ -155,7 +171,29 @@ func parsePage(url string, client *http.Client, result *CrawlerResult) {
 		doc.Find("h2").Each(func(i int, obj *goquery.Selection) {
 			result.H2Text = append(result.H2Text, obj.Text())
 		})
+
+		prompt := fmt.Sprintf("Summarize the content on the home page of the website %s.", url)
+
+		fmt.Println(prompt)
+
+		resp, err := gptClient.Completion(*ctx, gpt3.CompletionRequest{
+			Prompt:           []string{prompt},
+			Temperature:      gpt3.Float32Ptr(0.7),
+			MaxTokens:        gpt3.IntPtr(100),
+			TopP:             gpt3.Float32Ptr(1.0),
+			N:                gpt3.IntPtr(1),
+			FrequencyPenalty: 0.0,
+			PresencePenalty:  0.0,
+			Echo:             false,
+		})
+
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		result.Description = resp.Choices[0].Text
+		fmt.Println(result.Description)
 	}
 
-	fmt.Print(result)
+	wg.Done()
 }

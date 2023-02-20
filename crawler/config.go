@@ -4,4 +4,5 @@ type CrawlerConfig struct {
 	DomainFilePath    string
 	AnalyticsFilePath string
 	OutputFilePath    string
+	APIKey            string
 }
