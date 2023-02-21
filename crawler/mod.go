@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
+	"github.com/schollz/progressbar/v3"
 	"github.com/solywsh/chatgpt"
 )
 
@@ -67,13 +68,19 @@ func crawlDomains(config *CrawlerConfig, domains *[]string, results *[]CrawlerRe
 		CheckRedirect: noRedirect,
 	}
 
+	bar := progressbar.Default(int64(len(*domains)))
+
 	chat := chatgpt.New(config.APIKey, "user_id(not required)", 30*time.Second)
 	defer chat.Close()
 
+	maxRoutines := 5
+	guard := make(chan struct{}, maxRoutines)
+
 	for _, domain := range *domains {
+		guard <- struct{}{}
 		wg.Add(1)
 
-		go func(domain string) {
+		go func(domain string, bar *progressbar.ProgressBar) {
 			result := CrawlerResult{
 				Domain: domain,
 			}
@@ -82,9 +89,18 @@ func crawlDomains(config *CrawlerConfig, domains *[]string, results *[]CrawlerRe
 			https_url := fmt.Sprintf("https://%s/", domain)
 
 			result.AnswersHttp = checkUrl(http_url, &client)
-			result.RedirectHttps = checkRedirect(http_url, &redirectClient)
+			if result.AnswersHttp {
+				result.RedirectHttps = checkRedirect(http_url, &redirectClient)
+			} else {
+				result.RedirectHttps = false
+			}
+
 			result.AnswersHttps = checkUrl(https_url, &client)
-			result.ValidCertificate = checkCertificate(domain)
+			if result.AnswersHttps {
+				result.ValidCertificate = checkCertificate(domain)
+			} else {
+				result.ValidCertificate = false
+			}
 
 			if result.AnswersHttps {
 				https_url := fmt.Sprintf("https://%s", result.Domain)
@@ -92,8 +108,10 @@ func crawlDomains(config *CrawlerConfig, domains *[]string, results *[]CrawlerRe
 			}
 
 			(*results) = append(*results, result)
+			bar.Add(1)
 			wg.Done()
-		}(domain)
+			<-guard
+		}(domain, bar)
 	}
 
 	wg.Wait()
@@ -116,7 +134,7 @@ func checkUrl(url string, client *http.Client) bool {
 func checkRedirect(url string, client *http.Client) bool {
 	resp, err := client.Get(url)
 
-	if strings.HasSuffix(err.Error(), ": no such host") {
+	if (err != nil) && (!strings.HasSuffix(err.Error(), ": don't redirect")) {
 		return false
 	}
 
@@ -132,19 +150,13 @@ func checkCertificate(domain string) bool {
 
 	_, err := tls.Dial("tcp", domainWithPort, nil)
 
-	if err != nil {
-		return false
-	} else {
-		return true
-	}
-
-	return false
+	return err == nil
 }
 
 func parsePage(url string, client *http.Client, chat *chatgpt.ChatGPT, result CrawlerResult) CrawlerResult {
 	resp, err := client.Get(url)
 	if err != nil {
-		log.Fatal(err)
+		return result
 	}
 
 	defer resp.Body.Close()
