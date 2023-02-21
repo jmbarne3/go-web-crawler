@@ -20,12 +20,13 @@ import (
 
 func Crawl(config *CrawlerConfig) {
 	var domains []string
-	var results []CrawlerResult
 
 	parseDomainFile(&config.DomainFilePath, &domains)
+	results := make([]CrawlerResult, 0)
+
 	crawlDomains(config, &domains, &results)
-	addAnalytics(config, results)
-	writeOutput(config, results)
+	addAnalytics(config, &results)
+	writeOutput(config, &results)
 }
 
 func parseDomainFile(filepath *string, domains *[]string) {
@@ -66,93 +67,81 @@ func crawlDomains(config *CrawlerConfig, domains *[]string, results *[]CrawlerRe
 		CheckRedirect: noRedirect,
 	}
 
-	for _, domain := range *domains {
-		result := CrawlerResult{
-			Domain: domain,
-		}
-
-		http_url := fmt.Sprintf("http://%s/", domain)
-		https_url := fmt.Sprintf("https://%s/", domain)
-
-		wg.Add(4)
-
-		go checkUrl(http_url, &client, &result.AnswersHttp, &wg)
-		go checkRedirect(http_url, &redirectClient, &result.RedirectHttps, &wg)
-		go checkUrl(https_url, &client, &result.AnswersHttps, &wg)
-		go checkCertificate(domain, &result.ValidCertificate, &wg)
-
-		wg.Wait()
-		*results = append(*results, result)
-	}
-
-	var gptWg sync.WaitGroup
 	chat := chatgpt.New(config.APIKey, "user_id(not required)", 30*time.Second)
 	defer chat.Close()
 
-	for _, result := range *results {
-		if result.AnswersHttps {
-			gptWg.Add(1)
-			https_url := fmt.Sprintf("https://%s", result.Domain)
-			go parsePage(https_url, &client, chat, &result, &gptWg)
-		}
+	for _, domain := range *domains {
+		wg.Add(1)
+
+		go func(domain string) {
+			result := CrawlerResult{
+				Domain: domain,
+			}
+
+			http_url := fmt.Sprintf("http://%s/", domain)
+			https_url := fmt.Sprintf("https://%s/", domain)
+
+			result.AnswersHttp = checkUrl(http_url, &client)
+			result.RedirectHttps = checkRedirect(http_url, &redirectClient)
+			result.AnswersHttps = checkUrl(https_url, &client)
+			result.ValidCertificate = checkCertificate(domain)
+
+			if result.AnswersHttps {
+				https_url := fmt.Sprintf("https://%s", result.Domain)
+				result = parsePage(https_url, &client, chat, result)
+			}
+
+			(*results) = append(*results, result)
+			wg.Done()
+		}(domain)
 	}
 
-	gptWg.Wait()
+	wg.Wait()
 }
 
-func checkUrl(url string, client *http.Client, respond *bool, wg *sync.WaitGroup) {
+func checkUrl(url string, client *http.Client) bool {
 	resp, err := client.Get(url)
 
 	if err != nil {
-		*respond = false
-		wg.Done()
-		return
+		return false
 	}
 
 	if (resp.StatusCode >= 200) && (resp.StatusCode < 300) {
-		*respond = true
-		wg.Done()
-		return
+		return true
 	}
 
-	*respond = false
-	wg.Done()
+	return false
 }
 
-func checkRedirect(url string, client *http.Client, redirect *bool, wg *sync.WaitGroup) {
+func checkRedirect(url string, client *http.Client) bool {
 	resp, err := client.Get(url)
 
 	if strings.HasSuffix(err.Error(), ": no such host") {
-		*redirect = false
-		wg.Done()
-		return
+		return false
 	}
 
 	if (resp.StatusCode >= 301) && (resp.StatusCode <= 302) || (resp.StatusCode >= 307) && (resp.StatusCode <= 308) {
-		*redirect = true
-		wg.Done()
-		return
+		return true
 	}
 
-	*redirect = false
-	wg.Done()
+	return false
 }
 
-func checkCertificate(domain string, validCertificate *bool, wg *sync.WaitGroup) {
+func checkCertificate(domain string) bool {
 	domainWithPort := fmt.Sprintf("%s:%d", domain, 443)
 
 	_, err := tls.Dial("tcp", domainWithPort, nil)
 
 	if err != nil {
-		*validCertificate = false
+		return false
 	} else {
-		*validCertificate = true
+		return true
 	}
 
-	wg.Done()
+	return false
 }
 
-func parsePage(url string, client *http.Client, chat *chatgpt.ChatGPT, result *CrawlerResult, wg *sync.WaitGroup) {
+func parsePage(url string, client *http.Client, chat *chatgpt.ChatGPT, result CrawlerResult) CrawlerResult {
 	resp, err := client.Get(url)
 	if err != nil {
 		log.Fatal(err)
@@ -188,10 +177,10 @@ func parsePage(url string, client *http.Client, chat *chatgpt.ChatGPT, result *C
 		result.Description = ans
 	}
 
-	wg.Done()
+	return result
 }
 
-func addAnalytics(config *CrawlerConfig, results []CrawlerResult) {
+func addAnalytics(config *CrawlerConfig, results *[]CrawlerResult) {
 	records := make(map[string]AnalyticRecord)
 
 	f, err := os.Open(config.AnalyticsFilePath)
@@ -231,7 +220,7 @@ func addAnalytics(config *CrawlerConfig, results []CrawlerResult) {
 		}
 	}
 
-	for _, result := range results {
+	for idx, result := range *results {
 		if val, ok := records[result.Domain]; ok {
 			result.PageViews = val.PageViews
 			result.UniqueViews = val.UniqueViews
@@ -239,10 +228,12 @@ func addAnalytics(config *CrawlerConfig, results []CrawlerResult) {
 			result.BounceRate = val.BounceRate
 			result.ExitPercentage = val.ExitPercentage
 		}
+
+		(*results)[idx] = result
 	}
 }
 
-func writeOutput(config *CrawlerConfig, results []CrawlerResult) {
+func writeOutput(config *CrawlerConfig, results *[]CrawlerResult) {
 	f, err := os.Create(config.OutputFilePath)
 	if err != nil {
 		log.Fatal(err)
@@ -275,7 +266,7 @@ func writeOutput(config *CrawlerConfig, results []CrawlerResult) {
 		"exit_percentage",
 	})
 
-	for _, result := range results {
+	for _, result := range *results {
 		writer.Write([]string{
 			result.Domain,
 			fmt.Sprintf("%t", result.AnswersHttp),
