@@ -1,6 +1,7 @@
 package crawler
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/csv"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"github.com/PuerkitoBio/goquery"
 	"github.com/schollz/progressbar/v3"
 	"github.com/solywsh/chatgpt"
+	"golang.org/x/time/rate"
 )
 
 func Crawl(config *CrawlerConfig) {
@@ -70,17 +72,20 @@ func crawlDomains(config *CrawlerConfig, domains *[]string, results *[]CrawlerRe
 
 	bar := progressbar.Default(int64(len(*domains)))
 
-	chat := chatgpt.New(config.APIKey, "user_id(not required)", 30*time.Second)
+	chat := chatgpt.New(config.APIKey, "user_id(not required)", 60*time.Second)
 	defer chat.Close()
 
-	maxRoutines := 5
+	maxRoutines := 10
 	guard := make(chan struct{}, maxRoutines)
+	ctx := context.Background()
+	rateLimiter := rate.NewLimiter(rate.Every(time.Second), 1)
 
 	for _, domain := range *domains {
 		guard <- struct{}{}
+
 		wg.Add(1)
 
-		go func(domain string, bar *progressbar.ProgressBar) {
+		go func(domain string, bar *progressbar.ProgressBar, ctx context.Context, rateLimiter *rate.Limiter) {
 			result := CrawlerResult{
 				Domain: domain,
 			}
@@ -104,14 +109,16 @@ func crawlDomains(config *CrawlerConfig, domains *[]string, results *[]CrawlerRe
 
 			if result.AnswersHttps {
 				https_url := fmt.Sprintf("https://%s", result.Domain)
-				result = parsePage(https_url, &client, chat, result)
+				if err := rateLimiter.Wait(ctx); err == nil {
+					result = parsePage(https_url, &client, chat, result)
+				}
 			}
 
 			(*results) = append(*results, result)
 			bar.Add(1)
 			wg.Done()
 			<-guard
-		}(domain, bar)
+		}(domain, bar, ctx, rateLimiter)
 	}
 
 	wg.Wait()
@@ -183,7 +190,8 @@ func parsePage(url string, client *http.Client, chat *chatgpt.ChatGPT, result Cr
 		ans, err := chat.Chat(prompt)
 
 		if err != nil {
-			log.Fatal(err)
+			fmt.Println(err)
+			return result
 		}
 
 		result.Description = ans
